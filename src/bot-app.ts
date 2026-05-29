@@ -24,8 +24,8 @@ export const createBot = () => {
         cleanupIntervalMs: pendingCleanupIntervalMs,
     });
 
-    registerCommandHandlers(bot);
-    registerCallbackHandlers(bot, pendingCaptionEdits);
+    registerCommandHandlers(bot, pendingAudioCaptions, pendingCaptionEdits);
+    registerCallbackHandlers(bot, pendingAudioCaptions, pendingCaptionEdits);
     registerMessageHandlers(bot, pendingAudioCaptions, pendingCaptionEdits);
 
     return {

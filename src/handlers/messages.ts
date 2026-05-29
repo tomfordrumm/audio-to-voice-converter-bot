@@ -1,6 +1,6 @@
-import type {Bot} from 'grammy';
-import type {Audio} from '@grammyjs/types';
-import {editCaptionKeyboard} from '../keyboards';
+import type {Bot, Context} from 'grammy';
+import type {Audio, MessageEntity} from '@grammyjs/types';
+import {editCaptionKeyboard, pendingAudioCaptionKeyboard} from '../keyboards';
 import {t} from '../i18n';
 import {logger} from '../logger';
 import {
@@ -17,9 +17,22 @@ import type {PendingCaptionEdits} from './callbacks';
 export type PendingAudioCaption = {
     audio: Audio;
     sourceMessageId: number;
+    promptMessageId?: number;
 };
 
 export type PendingAudioCaptions = PendingStateStore<PendingAudioCaption>;
+
+const deletePrompt = async (ctx: Context, messageId?: number) => {
+    if (!ctx.chat || !messageId) {
+        return;
+    }
+
+    try {
+        await ctx.api.deleteMessage(ctx.chat.id, messageId);
+    } catch {
+        // The prompt may already be deleted manually; keep the user flow moving.
+    }
+};
 
 export const registerMessageHandlers = (
     bot: Bot,
@@ -73,11 +86,13 @@ export const registerMessageHandlers = (
             try {
                 await ctx.api.editMessageCaption(pending.chatId, pending.messageId, {
                     caption: text,
+                    caption_entities: ctx.message.entities,
                     reply_markup: editCaptionKeyboard(ctx, pending.conversionId),
                 });
                 updateCaptionLog(pending.conversionId, text);
                 createCaptionEditLog(ctx, pending.conversionId, pending.chatId, pending.messageId, text, 'success');
                 pendingCaptionEdits.delete(key);
+                await deletePrompt(ctx, pending.promptMessageId);
                 await reply(ctx, t(ctx, 'captionUpdated'));
             } catch (error) {
                 createCaptionEditLog(ctx, pending.conversionId, pending.chatId, pending.messageId, text, 'error', error);
@@ -109,27 +124,51 @@ export const registerMessageHandlers = (
                 return;
             }
 
-            await processAudio(ctx, pending.audio, text, pending.sourceMessageId);
+            await deletePrompt(ctx, pending.promptMessageId);
+            await processAudio(ctx, pending.audio, text, pending.sourceMessageId, ctx.message.entities);
             return;
         }
 
         if (ctx.message.audio) {
             const audio = ctx.message.audio;
             const caption = ctx.message.caption;
+            const captionEntities: MessageEntity[] | undefined = ctx.message.caption_entities;
 
-            if (caption === undefined) {
-                if (key) {
-                    pendingAudioCaptions.set(key, {
-                        audio,
-                        sourceMessageId: ctx.message.message_id,
-                    });
-                }
-
-                await reply(ctx, t(ctx, 'sendCaption'));
+            if (!key) {
+                await reply(ctx, t(ctx, 'missingAudioForCaption'));
                 return;
             }
 
-            await processAudio(ctx, audio, caption, ctx.message.message_id);
+            if (key) {
+                const pendingEdit = pendingCaptionEdits.get(key);
+                if (pendingEdit) {
+                    pendingCaptionEdits.delete(key);
+                    await deletePrompt(ctx, pendingEdit.promptMessageId);
+                }
+
+                const previousPendingAudio = pendingAudioCaptions.get(key);
+                if (previousPendingAudio) {
+                    pendingAudioCaptions.delete(key);
+                    await deletePrompt(ctx, previousPendingAudio.promptMessageId);
+                }
+            }
+
+            if (caption === undefined) {
+                const prompt = await ctx.reply(t(ctx, 'sendCaption'), {
+                    parse_mode: 'HTML',
+                    reply_markup: pendingAudioCaptionKeyboard(ctx, ctx.message.message_id),
+                });
+
+                pendingAudioCaptions.set(key, {
+                    audio,
+                    sourceMessageId: ctx.message.message_id,
+                    promptMessageId: prompt.message_id,
+                });
+
+                return;
+            }
+
+            await processAudio(ctx, audio, caption, ctx.message.message_id, captionEntities);
             return;
         }
 

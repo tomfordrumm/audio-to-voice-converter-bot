@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
 import { InputFile, type Context } from "grammy";
-import type { Audio } from "@grammyjs/types";
+import type { Audio, MessageEntity } from "@grammyjs/types";
 import { config } from "../config";
 import { errorMessage, isVoiceMessagesForbiddenError } from "../errors";
 import { formatMessage, t } from "../i18n";
@@ -88,11 +88,57 @@ export const sendLimitReached = async (ctx: Context) => {
   });
 };
 
+const editStatusMessage = async (
+  ctx: Context,
+  messageId: number | undefined,
+  message: string,
+) => {
+  if (!ctx.chat || !messageId) {
+    return false;
+  }
+
+  try {
+    await ctx.api.editMessageText(ctx.chat.id, messageId, message, {
+      parse_mode: "HTML",
+    });
+    return true;
+  } catch (error) {
+    logger.error("Could not edit conversion status message.", {
+      telegramUserId: ctx.from?.id,
+      chatId: ctx.chat.id,
+      messageId,
+      error,
+    });
+    return false;
+  }
+};
+
+const deleteStatusMessage = async (
+  ctx: Context,
+  messageId: number | undefined,
+) => {
+  if (!ctx.chat || !messageId) {
+    return;
+  }
+
+  try {
+    await ctx.api.deleteMessage(ctx.chat.id, messageId);
+  } catch (error) {
+    logger.error("Could not delete conversion status message.", {
+      telegramUserId: ctx.from?.id,
+      chatId: ctx.chat.id,
+      messageId,
+      error,
+    });
+  }
+};
+
 export const processAudio = async (
   ctx: Context,
   audio: Audio,
   caption: string,
   sourceMessageId: number,
+  captionEntities?: MessageEntity[],
 ) => {
   if (audio.file_size && audio.file_size > config.maxAudioFileSizeBytes) {
     await reply(
@@ -127,7 +173,9 @@ export const processAudio = async (
     return;
   }
 
-  await reply(ctx, t(ctx, "processing"));
+  const statusMessage = await ctx.reply(t(ctx, "processing"), {
+    parse_mode: "HTML",
+  });
 
   let inputPath: string | undefined;
 
@@ -150,16 +198,28 @@ export const processAudio = async (
     const currentInputPath = inputPath;
     const currentOutputPath = outputPath;
 
+    await editStatusMessage(ctx, statusMessage.message_id, t(ctx, "processingDownload"));
     await downloadFile(fileUrl, currentInputPath);
+
+    await editStatusMessage(ctx, statusMessage.message_id, t(ctx, "processingConvert"));
     await convertToVoiceOgg(currentInputPath, currentOutputPath);
+
+    await editStatusMessage(ctx, statusMessage.message_id, t(ctx, "processingSend"));
 
     const sentMessage = await ctx.replyWithVoice(
       new InputFile(currentOutputPath),
       {
-        caption,
+        ...(caption
+          ? {
+              caption,
+              caption_entities: captionEntities,
+            }
+          : {}),
         reply_markup: editCaptionKeyboard(ctx, conversionLogId),
       },
     );
+
+    await deleteStatusMessage(ctx, statusMessage.message_id);
 
     updateSuccessfulConversionLog(
       conversionLogId,
@@ -183,9 +243,13 @@ export const processAudio = async (
     });
 
     if (isVoiceMessagesForbiddenError(error)) {
-      await reply(ctx, t(ctx, "voiceMessagesForbidden"));
+      if (!(await editStatusMessage(ctx, statusMessage.message_id, t(ctx, "voiceMessagesForbidden")))) {
+        await reply(ctx, t(ctx, "voiceMessagesForbidden"));
+      }
     } else {
-      await reply(ctx, t(ctx, "conversionError"));
+      if (!(await editStatusMessage(ctx, statusMessage.message_id, t(ctx, "conversionError")))) {
+        await reply(ctx, t(ctx, "conversionError"));
+      }
     }
   } finally {
     if (inputPath && fs.existsSync(inputPath)) {
